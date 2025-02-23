@@ -1,26 +1,21 @@
+import openai
+import json
 from fastapi import FastAPI, Depends
 from pydantic import BaseModel
 import redis
 import psycopg2
 from datetime import datetime
 from typing import List
-import numpy as np
-import json
-import openai
-import os
 import os
 from dotenv import load_dotenv
 load_dotenv()
 
-# Set your OpenAI API key (You can also load from environment variables)
-open_api_key=os.environ.get("OPENAI_API_KEY")
-
 app = FastAPI()
 
-# Connect to Redis (Short-Term Memory)
+# Connect to Redis for chat history
 redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
 
-# Connect to PostgreSQL (Long-Term Memory + Vector Search)
+# Connect to PostgreSQL
 conn = psycopg2.connect(
     dbname="chat_memory",
     user="postgres",
@@ -30,121 +25,124 @@ conn = psycopg2.connect(
 )
 cursor = conn.cursor()
 
-# Define Embedding Dimension (OpenAI embeddings are 1536-dimensional)
-EMBEDDING_SIZE = 1536
+# OpenAI API setup
+open_api_key=os.environ.get("OPENAI_API_KEY")
+client = openai.OpenAI(api_key=open_api_key)
 
-# Pydantic Models
-class Message(BaseModel):
+# Define models
+class ChatMessage(BaseModel):
     user_id: str
     session_id: str
-    role: str  # "user" or "assistant"
-    content: str
-
-class SearchRequest(BaseModel):
-    query_vector: List[float]
-
-# Store messages in Redis (Short-Term Memory)
-@app.post("/chat")
-def store_message(message: Message):
-    redis_key = f"chat:{message.session_id}"
-    redis_client.rpush(redis_key, f"{message.role}: {message.content}")
-    return {"status": "Message stored"}
-
-# Retrieve chat history from Redis
-@app.get("/chat/{session_id}")
-def get_chat_history(session_id: str):
-    redis_key = f"chat:{session_id}"
-    messages = redis_client.lrange(redis_key, 0, -1)  # Get all messages
-    return {"messages": messages}
-
-# Function to summarize conversation (Placeholder for AI model)
-def generate_summary(messages):
-    return "This is a placeholder summary of the chat."
-
-
+    message: str
 
 def generate_openai_embedding(text: str):
-    """Fetch OpenAI embeddings for the given text using OpenAI's latest API format."""
-    client = openai.OpenAI()  # ✅ Create an OpenAI client
-
+    """Get OpenAI embeddings for similarity search."""
     response = client.embeddings.create(
         model="text-embedding-ada-002",
-        input=[text]  # OpenAI now requires a list input
+        input=[text]
     )
-    return response.data[0].embedding  # ✅ Correct way to access the embedding
+    return response.data[0].embedding  # Returns a 1536-dimension vector
 
-
-# Move chat from Redis to PostgreSQL and generate embeddings
-@app.post("/save_summary/{session_id}")
-def save_summary(session_id: str, user_id: str):
+def retrieve_chat_history(session_id: str, limit: int = 10):
+    """Retrieve last N messages from Redis."""
     redis_key = f"chat:{session_id}"
-    messages = redis_client.lrange(redis_key, 0, -1)  # Retrieve all messages
-    if not messages:
-        return {"status": "No messages found"}
+    messages = redis_client.lrange(redis_key, -limit, -1)
+    return messages or []
 
-    summary = generate_summary(messages)  # Replace with real AI summarization
-    
-    # 🔹 **Get OpenAI Embedding Instead of Random Vector**
-    embedding_vector = generate_openai_embedding(summary)
+def find_similar_conversations(query_text: str):
+    """Find similar past conversations from PostgreSQL."""
+    query_vector = generate_openai_embedding(query_text)
+    query_vector_str = json.dumps(query_vector)
 
     cursor.execute("""
-        INSERT INTO conversation_summaries (user_id, session_id, summary, embedding, created_at) 
-        VALUES (%s, %s, %s, %s, %s)
-    """, (user_id, session_id, summary, embedding_vector, datetime.now()))
+        SELECT session_id, summary, embedding <=> %s::vector AS distance
+        FROM conversation_summaries
+        ORDER BY distance
+        LIMIT 3;
+    """, (query_vector_str,))
     
-    conn.commit()
-    
-    # Clear Redis chat history after storing summary
-    redis_client.delete(redis_key)
-    
-    return {"status": "Summary stored", "summary": summary}
+    return cursor.fetchall()
 
-# Retrieve conversation summaries from PostgreSQL
-@app.get("/conversations/{user_id}")
-def get_conversations(user_id: str):
-    cursor.execute("SELECT session_id, summary, created_at FROM conversation_summaries WHERE user_id = %s", (user_id,))
-    conversations = cursor.fetchall()
-    
-    results = [
-        {"session_id": row[0], "summary": row[1], "created_at": row[2].isoformat()}
-        for row in conversations
-    ]
-    
-    return {"conversations": results}
 
-# API Endpoint to search similar conversations using `pgvector`
-@app.post("/search_similar")
-def search_similar(request: SearchRequest):
-    query_vector = request.query_vector
+def generate_chat_response(history: List[str], similar_chats: List[tuple], user_input: str):
+    """Generate AI chatbot response using OpenAI."""
+    messages = [{"role": "system", "content": "You are an AI assistant helping with chat-based memory retrieval."}]
 
-    # Ensure query vector is exactly 1536 dimensions
-    if len(query_vector) != 1536:
-        return {"error": f"Vector must be 1536 dimensions, received {len(query_vector)}"}
+    # Add past chat history (if available)
+    for msg in history:
+        messages.append({"role": "user", "content": str(msg)})  # Ensure all messages are strings
 
+    # Properly format similar past conversations
+    if similar_chats:
+        messages.append({"role": "system", "content": "Here are some similar past conversations that might help you:"})
+        for session_id, summary, distance in similar_chats:
+            formatted_summary = f"Session: {session_id}, Summary: {summary} (Similarity Score: {distance})"
+            messages.append({"role": "system", "content": formatted_summary})  # Ensure this is a string
+
+    # Add user input as the last message
+    messages.append({"role": "user", "content": user_input})
+
+    # ✅ Debugging: Print the exact structure of `messages` before sending
+    print(f"🔹 Sending Messages to OpenAI:\n{json.dumps(messages, indent=2)}")
+
+    # Get model from environment variable (default to GPT-4 if not set)
+    model_name = os.environ.get("OPENAI_MODEL", "gpt-4")
+
+    # Send to OpenAI API
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=messages
+    )
+
+    return response.choices[0].message.content
+
+
+
+@app.post("/chatbot")
+def chatbot(chat: ChatMessage):
+    """Main chatbot function that retrieves history, finds similar chats, and generates a response."""
     try:
-        # Convert list to proper PostgreSQL array format (JSON dump ensures brackets [])
-        query_vector_str = json.dumps(query_vector)
+        session_id = chat.session_id
+        user_input = chat.message
+        user_id = chat.user_id  # Added user_id from the request
 
-        # Debug: Print query string (First 100 chars for sanity check)
-        print(f"Query vector: {query_vector_str[:100]}...")
+        print(f"🔹 Received message: {user_input} (Session: {session_id})")
 
-        # Perform similarity search in PostgreSQL
+        # Step 1: Store user message in PostgreSQL
         cursor.execute("""
-            SELECT id, user_id, session_id, summary, embedding <=> %s::vector AS distance
-            FROM conversation_summaries
-            ORDER BY distance
-            LIMIT 5;
-        """, (query_vector_str,))
+            INSERT INTO chat_messages (user_id, session_id, role, message) 
+            VALUES (%s, %s, %s, %s)
+        """, (user_id, session_id, "user", user_input))
+        conn.commit()
 
-        results = cursor.fetchall()
+        # Retrieve past chat history (from Redis)
+        history = retrieve_chat_history(session_id)
+        print(f"📜 Chat history: {history}")
 
-        return {
-            "results": [
-                {"id": row[0], "user_id": row[1], "session_id": row[2], "summary": row[3], "distance": row[4]}
-                for row in results
-            ]
-        }
-    
+        # Find similar past conversations (from PostgreSQL)
+        similar_chats = find_similar_conversations(user_input)
+        print(f"🔍 Similar chats: {similar_chats}")
+
+        # Generate AI response
+        ai_response = generate_chat_response(history, similar_chats, user_input)
+        print(f"🤖 AI Response: {ai_response}")
+
+        # Step 2: Store AI response in PostgreSQL
+        cursor.execute("""
+            INSERT INTO chat_messages (user_id, session_id, role, message) 
+            VALUES (%s, %s, %s, %s)
+        """, (user_id, session_id, "assistant", ai_response))
+        conn.commit()
+
+        # Step 3: Store user input and AI response in Redis (short-term memory)
+        redis_key = f"chat:{session_id}"
+        redis_client.rpush(redis_key, f"user: {user_input}")
+        redis_client.rpush(redis_key, f"assistant: {ai_response}")
+
+        return {"response": ai_response}
+
     except Exception as e:
-        print(f"❌ Database Error: {e}")
-        return {"error": "Internal Server Error, check logs"}
+        print(f"❌ Chatbot API Error: {e}")
+        return {"error": "Internal Server Error"}
+
+
