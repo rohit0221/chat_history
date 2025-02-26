@@ -120,7 +120,7 @@ def generate_chat_response(history: List[str], similar_chats: List[tuple], user_
 
 @app.post("/chatbot")
 def chatbot(chat: ChatMessage):
-    """Main chatbot function that retrieves history, finds similar chats, and generates a response."""
+    """Handles user messages, retrieves chat history, and generates AI responses."""
     try:
         session_id = chat.session_id
         user_input = chat.message
@@ -128,22 +128,30 @@ def chatbot(chat: ChatMessage):
 
         print(f"🔹 Received message: {user_input} (Session: {session_id})")
 
-        # ✅ Detect "end session" and trigger session summary
+        # ✅ If session is new, load history from PostgreSQL
+        redis_key = f"chat:{session_id}"
+        history = retrieve_chat_history(session_id)
+
+        if not history:
+            cursor.execute("""
+                SELECT role, message FROM chat_messages 
+                WHERE session_id = %s ORDER BY created_at ASC
+            """, (session_id,))
+            history = [f"{row[0]}: {row[1]}" for row in cursor.fetchall()]
+            
+            # Save history in Redis for faster retrieval
+            if history:
+                redis_client.rpush(redis_key, *history)
+                redis_client.expire(redis_key, 3600)  # 1-hour expiry
+
+        print(f"📜 Loaded Chat History: {history}")
+
+        # ✅ Handle "end session" trigger
         if user_input.lower() in ["end session", "q", "quit"]:
             print(f"📌 Ending session {session_id} and generating summary...")
 
-            # Retrieve full chat history from PostgreSQL
-            cursor.execute(
-                "SELECT message FROM chat_messages WHERE session_id = %s ORDER BY created_at ASC",
-                (session_id,),
-            )
-            messages = [row[0] for row in cursor.fetchall()]
-
-            if not messages:
-                return {"status": "No messages found for session"}
-
-            # ✅ Generate session summary using OpenAI
-            summary_prompt = f"Summarize the following conversation in a few sentences:\n{messages}"
+            # Generate summary using OpenAI
+            summary_prompt = f"Summarize the following conversation:\n{history}"
             summary_response = openai.chat.completions.create(
                 model=os.environ.get("OPENAI_MODEL", "gpt-4"),
                 messages=[{"role": "user", "content": summary_prompt}]
@@ -152,57 +160,50 @@ def chatbot(chat: ChatMessage):
             session_summary = summary_response.choices[0].message.content.strip()
             print(f"📜 Generated Summary: {session_summary}")
 
-            # ✅ Store session summary in PostgreSQL
-            cursor.execute(
-                "INSERT INTO conversation_summaries (user_id, session_id, summary, created_at) VALUES (%s, %s, %s, %s)",
-                (user_id, session_id, session_summary, datetime.now()),
-            )
+            # Store summary in PostgreSQL
+            cursor.execute("""
+                INSERT INTO conversation_summaries (user_id, session_id, summary, created_at)
+                VALUES (%s, %s, %s, %s)
+            """, (user_id, session_id, session_summary, datetime.now()))
             conn.commit()
 
-            # ✅ Remove session data from Redis (cleanup)
-            redis_client.delete(f"chat:{session_id}")
+            # Remove session data from Redis
+            redis_client.delete(redis_key)
 
             return {"status": "Session ended", "summary": session_summary}
 
-        # Store user message in PostgreSQL
+        # ✅ Store user message in PostgreSQL
         cursor.execute("""
             INSERT INTO chat_messages (user_id, session_id, role, message) 
             VALUES (%s, %s, %s, %s)
         """, (user_id, session_id, "user", user_input))
         conn.commit()
 
-        # Retrieve chat history (from Redis)
-        history = retrieve_chat_history(session_id)
-        print(f"📜 Chat history: {history}")
-
-        # Find similar past conversations (from PostgreSQL)
+        # ✅ Find similar past conversations
         similar_chats = find_similar_conversations(user_input)
-        print(f"🔍 Similar chats: {similar_chats}")
 
-        # Generate AI response
+        # ✅ Generate AI response
         ai_response = generate_chat_response(history, similar_chats, user_input)
         print(f"🤖 AI Response: {ai_response}")
 
-        # Store AI response in PostgreSQL
+        # ✅ Store AI response in PostgreSQL
         cursor.execute("""
             INSERT INTO chat_messages (user_id, session_id, role, message) 
             VALUES (%s, %s, %s, %s)
         """, (user_id, session_id, "assistant", ai_response))
         conn.commit()
 
-        # Store user input and AI response in Redis (short-term memory)
-        redis_key = f"chat:{session_id}"
+        # ✅ Store both messages in Redis
         redis_client.rpush(redis_key, f"user: {user_input}")
         redis_client.rpush(redis_key, f"assistant: {ai_response}")
+        redis_client.expire(redis_key, 3600)  # Extend expiry
 
-        # Set TTL for Redis key (session expires after 1 hour)
-        redis_client.expire(redis_key, 3600)  # 3600 seconds = 1 hour
-
-        return {"response": ai_response}
+        return {"response": ai_response, "chat_history": history}
 
     except Exception as e:
         print(f"❌ Chatbot API Error: {e}")
         return {"error": "Internal Server Error"}
+
 
 
 
@@ -262,9 +263,14 @@ def get_conversations(user_id: str):
 # Once users see a list of summaries, they might want to click on a session and retrieve full messages.
 
 @app.get("/chat_history/{session_id}")
+@app.get("/chat_history/{session_id}")
 def get_chat_history(session_id: str):
-    """Retrieve full chat messages from a past session."""
-    cursor.execute("SELECT role, message, created_at FROM chat_messages WHERE session_id = %s ORDER BY created_at ASC", (session_id,))
+    """Retrieve full chat history for a given session."""
+    cursor.execute("""
+        SELECT role, message, created_at FROM chat_messages 
+        WHERE session_id = %s ORDER BY created_at ASC
+    """, (session_id,))
+    
     messages = cursor.fetchall()
 
     return {
@@ -274,3 +280,4 @@ def get_chat_history(session_id: str):
             for row in messages
         ]
     }
+
