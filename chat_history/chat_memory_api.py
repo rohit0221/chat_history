@@ -12,6 +12,16 @@ load_dotenv()
 
 app = FastAPI()
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins (change to ["http://localhost:3000"] if needed)
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all HTTP methods (GET, POST, OPTIONS, etc.)
+    allow_headers=["*"],  # Allow all headers
+)
+
 # Connect to Redis for chat history
 redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
 
@@ -64,6 +74,14 @@ def find_similar_conversations(query_text: str):
     return cursor.fetchall()
 
 
+import openai
+
+import openai
+
+import openai
+
+import openai
+
 def generate_chat_response(history: List[str], similar_chats: List[tuple], user_input: str):
     """Generate AI chatbot response using OpenAI."""
     messages = [{"role": "system", "content": "You are an AI assistant helping with chat-based memory retrieval."}]
@@ -88,13 +106,15 @@ def generate_chat_response(history: List[str], similar_chats: List[tuple], user_
     # Get model from environment variable (default to GPT-4 if not set)
     model_name = os.environ.get("OPENAI_MODEL", "gpt-4")
 
-    # Send to OpenAI API
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=messages
+    # ✅ Correct OpenAI API call for chat models
+    response = openai.chat.completions.create(
+        model=model_name,  # The model to use (e.g., gpt-4 or gpt-3.5-turbo)
+        messages=messages  # Correct parameter for chat models
     )
 
-    return response.choices[0].message.content
+    return response.choices[0].message.content.strip()
+
+
 
 
 
@@ -104,18 +124,54 @@ def chatbot(chat: ChatMessage):
     try:
         session_id = chat.session_id
         user_input = chat.message
-        user_id = chat.user_id  # Added user_id from the request
+        user_id = chat.user_id
 
         print(f"🔹 Received message: {user_input} (Session: {session_id})")
 
-        # Step 1: Store user message in PostgreSQL
+        # ✅ Detect "end session" and trigger session summary
+        if user_input.lower() in ["end session", "q", "quit"]:
+            print(f"📌 Ending session {session_id} and generating summary...")
+
+            # Retrieve full chat history from PostgreSQL
+            cursor.execute(
+                "SELECT message FROM chat_messages WHERE session_id = %s ORDER BY created_at ASC",
+                (session_id,),
+            )
+            messages = [row[0] for row in cursor.fetchall()]
+
+            if not messages:
+                return {"status": "No messages found for session"}
+
+            # ✅ Generate session summary using OpenAI
+            summary_prompt = f"Summarize the following conversation in a few sentences:\n{messages}"
+            summary_response = openai.chat.completions.create(
+                model=os.environ.get("OPENAI_MODEL", "gpt-4"),
+                messages=[{"role": "user", "content": summary_prompt}]
+            )
+
+            session_summary = summary_response.choices[0].message.content.strip()
+            print(f"📜 Generated Summary: {session_summary}")
+
+            # ✅ Store session summary in PostgreSQL
+            cursor.execute(
+                "INSERT INTO conversation_summaries (user_id, session_id, summary, created_at) VALUES (%s, %s, %s, %s)",
+                (user_id, session_id, session_summary, datetime.now()),
+            )
+            conn.commit()
+
+            # ✅ Remove session data from Redis (cleanup)
+            redis_client.delete(f"chat:{session_id}")
+
+            return {"status": "Session ended", "summary": session_summary}
+
+        # Store user message in PostgreSQL
         cursor.execute("""
             INSERT INTO chat_messages (user_id, session_id, role, message) 
             VALUES (%s, %s, %s, %s)
         """, (user_id, session_id, "user", user_input))
         conn.commit()
 
-        # Retrieve past chat history (from Redis)
+        # Retrieve chat history (from Redis)
         history = retrieve_chat_history(session_id)
         print(f"📜 Chat history: {history}")
 
@@ -127,17 +183,20 @@ def chatbot(chat: ChatMessage):
         ai_response = generate_chat_response(history, similar_chats, user_input)
         print(f"🤖 AI Response: {ai_response}")
 
-        # Step 2: Store AI response in PostgreSQL
+        # Store AI response in PostgreSQL
         cursor.execute("""
             INSERT INTO chat_messages (user_id, session_id, role, message) 
             VALUES (%s, %s, %s, %s)
         """, (user_id, session_id, "assistant", ai_response))
         conn.commit()
 
-        # Step 3: Store user input and AI response in Redis (short-term memory)
+        # Store user input and AI response in Redis (short-term memory)
         redis_key = f"chat:{session_id}"
         redis_client.rpush(redis_key, f"user: {user_input}")
         redis_client.rpush(redis_key, f"assistant: {ai_response}")
+
+        # Set TTL for Redis key (session expires after 1 hour)
+        redis_client.expire(redis_key, 3600)  # 3600 seconds = 1 hour
 
         return {"response": ai_response}
 
@@ -146,3 +205,72 @@ def chatbot(chat: ChatMessage):
         return {"error": "Internal Server Error"}
 
 
+
+
+def generate_summary(messages: List[str]) -> str:
+    """Generate a summary of the conversation using OpenAI."""
+    summary_prompt = "Please summarize the following conversation:\n" + "\n".join(messages)
+    
+    response = client.completions.create(
+        model=os.environ.get("OPENAI_MODEL"),
+        prompt=summary_prompt,
+        max_tokens=150
+    )
+    
+    return response.choices[0].text.strip()  # Return the summary text
+
+@app.post("/save_summary/{session_id}")
+def save_summary(session_id: str, user_id: str):
+    """Generate and save a summary of the conversation."""
+    # Retrieve chat history from Redis
+    history = retrieve_chat_history(session_id)
+    
+    if not history:
+        return {"status": "No messages found to summarize"}
+    
+    # Generate summary using OpenAI
+    summary = generate_summary(history)
+    
+    # Insert the summary into PostgreSQL
+    cursor.execute("""
+        INSERT INTO conversation_summaries (user_id, session_id, summary, created_at)
+        VALUES (%s, %s, %s, %s)
+    """, (user_id, session_id, summary, datetime.now()))
+    
+    conn.commit()
+    
+    return {"status": "Summary stored", "summary": summary}
+
+
+# 1️⃣ Allow User to Retrieve Past Conversations
+# Right now, each session starts fresh. Add an API to list past conversations and retrieve messages from a selected session.
+
+@app.get("/conversations/{user_id}")
+def get_conversations(user_id: str):
+    """Retrieve conversation summaries for a user."""
+    cursor.execute("SELECT session_id, summary, created_at FROM conversation_summaries WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
+    conversations = cursor.fetchall()
+
+    return {
+        "conversations": [
+            {"session_id": row[0], "summary": row[1], "created_at": row[2].isoformat()}
+            for row in conversations
+        ]
+    }
+
+# 2️⃣ Retrieve Full Chat Messages for a Past Session
+# Once users see a list of summaries, they might want to click on a session and retrieve full messages.
+
+@app.get("/chat_history/{session_id}")
+def get_chat_history(session_id: str):
+    """Retrieve full chat messages from a past session."""
+    cursor.execute("SELECT role, message, created_at FROM chat_messages WHERE session_id = %s ORDER BY created_at ASC", (session_id,))
+    messages = cursor.fetchall()
+
+    return {
+        "session_id": session_id,
+        "messages": [
+            {"role": row[0], "message": row[1], "created_at": row[2].isoformat()}
+            for row in messages
+        ]
+    }
