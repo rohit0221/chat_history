@@ -223,24 +223,41 @@ def generate_summary(messages: List[str]) -> str:
 @app.post("/save_summary/{session_id}")
 def save_summary(session_id: str, user_id: str):
     """Generate and save a summary of the conversation."""
-    # Retrieve chat history from Redis
-    history = retrieve_chat_history(session_id)
-    
-    if not history:
+
+    # Retrieve full chat history
+    cursor.execute(
+        "SELECT message FROM chat_messages WHERE session_id = %s ORDER BY created_at ASC",
+        (session_id,),
+    )
+    messages = [row[0] for row in cursor.fetchall()]
+
+    if not messages:
         return {"status": "No messages found to summarize"}
-    
-    # Generate summary using OpenAI
-    summary = generate_summary(history)
-    
-    # Insert the summary into PostgreSQL
-    cursor.execute("""
-        INSERT INTO conversation_summaries (user_id, session_id, summary, created_at)
-        VALUES (%s, %s, %s, %s)
-    """, (user_id, session_id, summary, datetime.now()))
-    
-    conn.commit()
-    
-    return {"status": "Summary stored", "summary": summary}
+
+    try:
+        # ✅ Use correct OpenAI chat API call
+        summary_prompt = f"Summarize the following conversation in a few sentences:\n{messages}"
+        summary_response = client.chat.completions.create(
+            model=os.environ.get("OPENAI_MODEL", "gpt-4"),
+            messages=[{"role": "user", "content": summary_prompt}]
+        )
+
+        session_summary = summary_response.choices[0].message.content.strip()
+        print(f"📜 Generated Summary: {session_summary}")
+
+        # ✅ Store the summary in PostgreSQL
+        cursor.execute(
+            "INSERT INTO conversation_summaries (user_id, session_id, summary, created_at) VALUES (%s, %s, %s, %s)",
+            (user_id, session_id, session_summary, datetime.now()),
+        )
+        conn.commit()
+
+        return {"status": "Session ended", "summary": session_summary}
+
+    except Exception as e:
+        print(f"❌ Error in save_summary: {e}")
+        return {"error": "Failed to generate summary"}
+
 
 
 # 1️⃣ Allow User to Retrieve Past Conversations
